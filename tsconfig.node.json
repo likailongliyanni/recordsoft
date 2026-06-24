@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "types": ["node", "electron"],
+    "outDir": "dist-types/node"
+  },
+  "include": ["src/main/**/*.ts", "src/preload/**/*.ts", "electron.vite.config.ts"]
+}

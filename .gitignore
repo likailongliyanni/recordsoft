@@ -1,0 +1,8 @@
+node_modules
+dist
+dist-types
+*.log
+*.mp4
+out
+release
+.env
