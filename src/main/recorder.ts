@@ -395,6 +395,14 @@ function listAudioDevices(ffmpegPath: string): string[] {
   let inAudioSection = false;
 
   for (const line of result.split(/\r?\n/)) {
+    // FFmpeg 5/6：设备名后直接标记 (audio)，不再输出旧版的音频分区标题。
+    const taggedAudio = line.match(/"([^"]+)"\s+\(audio\)/i);
+    if (taggedAudio?.[1]) {
+      devices.push(taggedAudio[1]);
+      continue;
+    }
+
+    // 兼容旧版 FFmpeg 的分区式输出。
     if (line.includes('DirectShow audio devices')) {
       inAudioSection = true;
       continue;
