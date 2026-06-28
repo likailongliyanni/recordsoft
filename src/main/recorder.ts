@@ -1,6 +1,6 @@
 import { app, BrowserWindow, dialog, screen, shell } from 'electron';
 import { ChildProcessWithoutNullStreams, spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
@@ -140,6 +140,7 @@ export class RecorderController {
       this.runtime.status = 'error';
       this.runtime.lastError = error.message;
       this.process = null;
+      this.cleanupFailedOutput();
       this.emit();
     });
 
@@ -154,7 +155,9 @@ export class RecorderController {
       this.effectiveFps = null;
       this.runtime.activeCaptureBackend = null;
       if (!ok) {
-        this.runtime.lastError = `FFmpeg exited with code ${code ?? 'unknown'}.`;
+        const detail = this.runtime.logTail.slice(-4).join('\n');
+        this.runtime.lastError = detail || `FFmpeg exited with code ${code ?? 'unknown'}.`;
+        this.cleanupFailedOutput();
       }
       this.syncOverlay();
       this.emit();
@@ -235,6 +238,19 @@ export class RecorderController {
     this.emit();
   }
 
+  private cleanupFailedOutput(): void {
+    const outputFile = this.runtime.outputFile;
+    if (!outputFile || !existsSync(outputFile)) return;
+
+    try {
+      unlinkSync(outputFile);
+      this.appendLog(`已删除失败录制产生的空文件：${outputFile}`);
+      this.runtime.outputFile = null;
+    } catch (error) {
+      this.appendLog(`清理失败录制文件时出错：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   private emit(): void {
     this.syncOverlay();
     this.windowProvider()?.webContents.send('recorder:runtime-update', this.getState());
@@ -281,39 +297,50 @@ function probeFfmpeg(): RecorderProbe {
       ffmpegPath: null,
       available: false,
       captureBackend: 'unavailable',
+      captureBackends: [],
       encoder: null,
       hardwareEncoder: false,
       displayRefreshRate: null,
       encoders: [],
       filters: [],
       audioDevices: [],
-      message: '未找到 FFmpeg。请设置 PROJETX_FFMPEG_PATH，或让 npm 安装的 @ffmpeg-installer/ffmpeg 可用。'
+      message: '未找到 FFmpeg。请设置 PROJETX_FFMPEG_PATH，或重新安装软件。'
     };
   }
 
   const encoderText = runFfmpeg(ffmpegPath, ['-hide_banner', '-encoders']);
   const filterText = runFfmpeg(ffmpegPath, ['-hide_banner', '-filters']);
+  const deviceText = runFfmpeg(ffmpegPath, ['-hide_banner', '-devices']);
   const audioDevices = listAudioDevices(ffmpegPath);
 
   const encoders = parseCapabilities(encoderText, [...HW_ENCODERS, 'libx264']);
   const filters = parseCapabilities(filterText, ['ddagrab']);
-  const encoder = chooseEncoder(encoders);
-  const captureBackend = filters.includes('ddagrab') ? 'ddagrab' : 'gdigrab';
+  const captureBackends: CaptureBackend[] = [];
+  if (filters.includes('ddagrab')) captureBackends.push('ddagrab');
+  if (/\bgdigrab\b/.test(deviceText)) captureBackends.push('gdigrab');
+  const encoder = chooseEncoder(ffmpegPath, encoders);
+  const captureBackend: RecorderProbe['captureBackend'] = captureBackends.includes('ddagrab')
+    ? 'ddagrab'
+    : (captureBackends.includes('gdigrab') ? 'gdigrab' : 'unavailable');
   const displayRefreshRate = getDisplayRefreshRate(0);
+  const available = Boolean(encoder) && captureBackend !== 'unavailable';
 
   return {
     ffmpegPath,
-    available: Boolean(encoder),
+    available,
     captureBackend,
+    captureBackends,
     encoder,
     hardwareEncoder: encoder ? HW_ENCODERS.includes(encoder) : false,
     displayRefreshRate,
     encoders,
     filters,
     audioDevices,
-    message: encoder
-      ? `录制引擎可用：${captureBackend} + ${encoder}${captureBackend === 'gdigrab' ? '（建议安装新版 FFmpeg 以启用 ddagrab）' : ''}`
-      : 'FFmpeg 可执行文件存在，但没有发现可用的 H.264/HEVC 编码器。'
+    message: !captureBackends.length
+      ? '当前 FFmpeg 不支持 Windows 桌面抓屏，请重新安装最新版软件。'
+      : (encoder
+          ? `录制引擎可用：${captureBackend} + ${encoder}`
+          : 'FFmpeg 存在，但没有发现能在当前电脑上实际工作的 H.264 编码器。')
   };
 }
 
@@ -322,8 +349,7 @@ function resolveFfmpegPath(): string | null {
     process.env.PROJETX_FFMPEG_PATH,
     path.join(process.resourcesPath ?? '', 'ffmpeg', 'ffmpeg.exe'),
     findPathFfmpeg(),
-    loadStaticPath(),
-    loadInstallerPath()
+    loadStaticPath()
   ].filter(Boolean) as string[];
 
   for (const candidate of candidates) {
@@ -339,15 +365,6 @@ function findPathFfmpeg(): string | null {
   return firstPath && existsSync(firstPath) ? firstPath : null;
 }
 
-function loadInstallerPath(): string | null {
-  try {
-    const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg') as { path?: string };
-    return ffmpegInstaller.path ?? null;
-  } catch {
-    return null;
-  }
-}
-
 function loadStaticPath(): string | null {
   try {
     const ffmpegStatic = require('ffmpeg-static') as string | null;
@@ -361,6 +378,7 @@ function runFfmpeg(ffmpegPath: string, args: string[]): string {
   const result = spawnSync(ffmpegPath, args, {
     encoding: 'utf8',
     windowsHide: true,
+    timeout: 7000,
     maxBuffer: 8 * 1024 * 1024
   });
 
@@ -411,7 +429,7 @@ function ensureDirectory(directory: string): boolean {
   }
 }
 
-function chooseEncoder(encoders: string[]): string | null {
+function chooseEncoder(ffmpegPath: string, encoders: string[]): string | null {
   const gpuHint = detectGpuHint();
   const byGpu: Record<string, string[]> = {
     nvidia: ['h264_nvenc', 'hevc_nvenc'],
@@ -420,14 +438,31 @@ function chooseEncoder(encoders: string[]): string | null {
   };
 
   for (const encoder of byGpu[gpuHint] ?? []) {
-    if (encoders.includes(encoder)) return encoder;
+    if (encoders.includes(encoder) && testEncoder(ffmpegPath, encoder)) return encoder;
   }
 
-  for (const encoder of ['h264_qsv', 'h264_amf', 'h264_nvenc', 'libx264']) {
-    if (encoders.includes(encoder)) return encoder;
+  if (encoders.includes('libx264') && testEncoder(ffmpegPath, 'libx264')) {
+    return 'libx264';
   }
 
   return null;
+}
+
+function testEncoder(ffmpegPath: string, encoder: string): boolean {
+  const result = spawnSync(ffmpegPath, [
+    '-v', 'error',
+    '-f', 'lavfi',
+    '-i', 'color=c=black:s=128x72:r=1',
+    '-frames:v', '1',
+    '-c:v', encoder,
+    '-f', 'null', '-'
+  ], {
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout: 7000
+  });
+
+  return result.status === 0;
 }
 
 function detectGpuHint(): 'nvidia' | 'intel' | 'amd' | 'unknown' {
@@ -474,9 +509,11 @@ function resolveEffectiveFps(settings: RecorderSettings, probe: RecorderProbe, a
 }
 
 function resolveCaptureBackend(probe: RecorderProbe, settings: RecorderSettings): CaptureBackend {
-  if (settings.captureBackendPreference === 'gdigrab') return 'gdigrab';
-  if (settings.captureBackendPreference === 'ddagrab' && probe.captureBackend === 'ddagrab') return 'ddagrab';
-  return probe.captureBackend === 'ddagrab' ? 'ddagrab' : 'gdigrab';
+  if (!probe.hardwareEncoder && probe.captureBackends.includes('gdigrab')) return 'gdigrab';
+  if (settings.captureBackendPreference === 'gdigrab' && probe.captureBackends.includes('gdigrab')) return 'gdigrab';
+  if (settings.captureBackendPreference === 'ddagrab' && probe.captureBackends.includes('ddagrab')) return 'ddagrab';
+  if (probe.captureBackends.includes('ddagrab')) return 'ddagrab';
+  return 'gdigrab';
 }
 
 function estimateCaptureArea(settings: RecorderSettings): number {

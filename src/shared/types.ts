@@ -39,6 +39,7 @@ export interface RecorderProbe {
   ffmpegPath: string | null;
   available: boolean;
   captureBackend: 'ddagrab' | 'gdigrab' | 'unavailable';
+  captureBackends: CaptureBackend[];
   encoder: string | null;
   hardwareEncoder: boolean;
   displayRefreshRate: number | null;
