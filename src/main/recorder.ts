@@ -517,6 +517,9 @@ function resolveEffectiveFps(settings: RecorderSettings, probe: RecorderProbe, a
 }
 
 function resolveCaptureBackend(probe: RecorderProbe, settings: RecorderSettings): CaptureBackend {
+  // FFmpeg 6.1 的 ddagrab 与 DirectShow 音频组合在部分 Windows/显卡驱动上会
+  // 卡在输入初始化阶段（显示录制中但不产生帧）。录音时优先使用稳定的 gdigrab。
+  if (settings.audioEnabled && probe.captureBackends.includes('gdigrab')) return 'gdigrab';
   if (!probe.hardwareEncoder && probe.captureBackends.includes('gdigrab')) return 'gdigrab';
   if (settings.captureBackendPreference === 'gdigrab' && probe.captureBackends.includes('gdigrab')) return 'gdigrab';
   if (settings.captureBackendPreference === 'ddagrab' && probe.captureBackends.includes('ddagrab')) return 'ddagrab';
@@ -633,7 +636,7 @@ function buildFfmpegArgs(probe: RecorderProbe, settings: RecorderSettings, outpu
 
     args.push('-f', 'lavfi', '-i', source);
   } else {
-    args.push('-f', 'gdigrab', '-framerate', String(fps), '-draw_mouse', settings.includeCursor ? '1' : '0');
+    args.push('-thread_queue_size', '1024', '-f', 'gdigrab', '-framerate', String(fps), '-draw_mouse', settings.includeCursor ? '1' : '0');
     if (settings.mode === 'region') {
       args.push('-offset_x', String(region.x), '-offset_y', String(region.y), '-video_size', `${region.width}x${region.height}`);
     }
